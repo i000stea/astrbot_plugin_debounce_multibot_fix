@@ -118,6 +118,9 @@ class DebouncePlugin(Star):
         
         # 正在等待session lock的消息ID {scoped_session_id: scoped_msg_id}
         self.waiting_msg_ids: Dict[str, str] = {}
+
+        # 会话归属 {scoped_session_id: self_id}
+        self.session_owners: Dict[str, str] = {}
         
         # 应该被取消的消息ID集合（在on_llm_request中直接取消）
         self.should_cancel_msg_ids: set = set()
@@ -276,6 +279,25 @@ class DebouncePlugin(Star):
             self.buffers[session_id] = MessageBuffer()
         return self.buffers[session_id]
 
+    def _bind_session_owner(self, event: AstrMessageEvent, session_id: str) -> bool:
+        """将会话绑定到当前 bot；若已被其他 bot 占用则拒绝。"""
+        self_id = event.get_self_id() or ""
+        owner = self.session_owners.get(session_id)
+        if owner and owner != self_id:
+            return False
+        self.session_owners[session_id] = self_id
+        return True
+
+    def _is_session_owned_by_self(self, event: AstrMessageEvent, session_id: str, strict: bool = False) -> bool:
+        """当前会话是否归属于当前 bot。
+
+        strict=True 时，未建立归属也视为不通过，适合后续消息捕获。
+        """
+        owner = self.session_owners.get(session_id)
+        if not owner:
+            return not strict
+        return owner == (event.get_self_id() or "")
+
     def _should_handle_event(self, event: AstrMessageEvent) -> bool:
         """检查插件开关和使用场景。"""
         if not self.config.get("enabled", True):
@@ -299,6 +321,8 @@ class DebouncePlugin(Star):
             return
 
         session_id = self._get_session_key(event)
+        if not self._is_session_owned_by_self(event, session_id, strict=True):
+            return
         if session_id not in self.waiting_sessions and session_id not in self.pending_llm_sessions:
             return
 
@@ -325,6 +349,7 @@ class DebouncePlugin(Star):
         full_text = buffer.get_full_text()
         threshold = self.config.get("send_threshold", 0.5)
         is_complete = False
+        should_defer_until_pending_done = session_id in self.pending_llm_sessions
 
         if self.classifier is None:
             try:
@@ -340,7 +365,7 @@ class DebouncePlugin(Star):
                 f"判定: {'发送' if is_complete else '继续等待'}"
             )
 
-        if is_complete:
+        if is_complete and not should_defer_until_pending_done:
             saved_event = buffer.event
             self.waiting_sessions.discard(session_id)
             buffer.clear()
@@ -348,6 +373,12 @@ class DebouncePlugin(Star):
             logger.debug(f"[Debounce] 非唤醒后续消息达到阈值，合并发送: {session_id}, text={full_text}")
             await self._send_fake_event(saved_event, full_text)
             return
+
+        if is_complete and should_defer_until_pending_done:
+            logger.debug(
+                f"[Debounce] 当前 LLM 仍在处理中，延后发送合并消息: {session_id}, "
+                f"text={full_text}"
+            )
 
         timeout_seconds = self.config.get("timeout_seconds", 30)
         if timeout_seconds > 0:
@@ -386,6 +417,9 @@ class DebouncePlugin(Star):
             return
         
         session_id = self._get_session_key(event)
+        if not self._bind_session_owner(event, session_id):
+            logger.debug(f"[Debounce] 非当前bot会话，忽略: {session_id}")
+            return
         msg_id = self._get_msg_key(event)
         
         # 跳过伪造消息
@@ -435,6 +469,9 @@ class DebouncePlugin(Star):
             return
         
         session_id = self._get_session_key(event)
+        if not self._bind_session_owner(event, session_id):
+            logger.debug(f"[Debounce] 非当前bot会话，忽略 LLM 请求: {session_id}")
+            return
         message_text = event.message_str.strip()
         msg_id = self._get_msg_key(event)
         
@@ -608,6 +645,7 @@ class DebouncePlugin(Star):
         # 清除待处理标记(无论是否丢弃,这个LLM会话都已结束)
         self.pending_llm_sessions.discard(session_id)
         self.discard_next_response.discard(session_id)
+        self.session_owners.pop(session_id, None)
     
     async def _timeout_checker(self):
         """后台任务：定期清理过期的缓冲区"""
@@ -644,6 +682,7 @@ class DebouncePlugin(Star):
         self.waiting_sessions.clear()
         self.waiting_msg_ids.clear()
         self.should_cancel_msg_ids.clear()
+        self.session_owners.clear()
         self.classifier = None
         logger.debug("🛑 消息防抖插件已卸载")
     
@@ -672,6 +711,7 @@ class DebouncePlugin(Star):
             
             # 清除等待状态
             self.waiting_sessions.discard(session_id)
+            self.session_owners.pop(session_id, None)
             buffer.clear()
             
             # 伪造一个新消息事件
