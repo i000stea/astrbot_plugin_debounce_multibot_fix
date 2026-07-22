@@ -59,7 +59,7 @@
 
 ```bash
 cd AstrBot/data/plugins
-git clone https://github.com/yourusername/astrbot_plugin_debounce.git
+git clone https://github.com/yourusername/astrbot_plugin_debounce.git astrbot_plugin_debounce_multibot_fix
 ```
 
 然后在 AstrBot WebUI 中重载插件列表。
