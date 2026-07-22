@@ -235,7 +235,7 @@ platform_id:self_id:group_id:sender_id:session_id
 
 本次修复还对伪造消息和待取消消息做了同样的隔离：内部消息键改为 `scoped_session_id:message_id`，避免不同机器人产生相同 `message_id` 时互相影响。
 
-另外，插件会在已有防抖等待或 LLM 处理中时捕获同一作用域下的非唤醒后续消息。例如用户先 `@机器人 你到底`，随后直接发送 `为什么又不行了`，第二条消息虽然不会单独唤醒 LLM，也会被加入同一个 buffer 并触发合并发送。
+另外，插件会在已有防抖等待或 LLM 处理中时捕获同一作用域下的非唤醒后续消息。例如用户先 `@机器人 你到底`，随后直接发送 `为什么又不行了`，第二条消息虽然不会单独唤醒 LLM，也会被加入同一个 buffer。捕获后会重新判断完整性：达到 `send_threshold` 就立即合并发送；未达到阈值则重置 `timeout_seconds` 倒计时，直到用户停顿超时后再发送。
 
 注意：如果你同时安装了原版 `astrbot_plugin_debounce` 和本修复版，请在 AstrBot 中禁用原版插件，只保留 `astrbot_plugin_debounce_multibot_fix`。原版仍使用旧的状态和伪造事件逻辑，继续启用会再次引入串台风险。
 

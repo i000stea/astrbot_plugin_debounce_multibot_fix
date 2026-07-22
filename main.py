@@ -322,17 +322,30 @@ class DebouncePlugin(Star):
         buffer.add(message_text, event)
         self.waiting_sessions.add(session_id)
 
-        if len(buffer.messages) > 1:
-            if session_id in self.monitor_tasks:
-                self.monitor_tasks[session_id].cancel()
-                del self.monitor_tasks[session_id]
+        full_text = buffer.get_full_text()
+        threshold = self.config.get("send_threshold", 0.5)
+        is_complete = False
 
-            full_text = buffer.get_full_text()
+        if self.classifier is None:
+            try:
+                await self._load_classifier_async()
+            except Exception as e:
+                logger.warning(f"模型加载失败，非唤醒后续消息仅重置倒计时: {e}")
+
+        if self.classifier is not None:
+            score_send, _ = await self.classifier.predict(full_text)
+            is_complete = score_send >= threshold
+            logger.debug(
+                f"[Debounce] 非唤醒后续消息完整概率: {score_send:.2f} | "
+                f"判定: {'发送' if is_complete else '继续等待'}"
+            )
+
+        if is_complete:
             saved_event = buffer.event
             self.waiting_sessions.discard(session_id)
             buffer.clear()
 
-            logger.debug(f"[Debounce] 非唤醒后续消息触发合并发送: {session_id}, text={full_text}")
+            logger.debug(f"[Debounce] 非唤醒后续消息达到阈值，合并发送: {session_id}, text={full_text}")
             await self._send_fake_event(saved_event, full_text)
             return
 
