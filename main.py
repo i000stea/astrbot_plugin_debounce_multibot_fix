@@ -239,11 +239,20 @@ class DebouncePlugin(Star):
     
     def _get_session_key(self, event: AstrMessageEvent) -> str:
         """生成插件内部会话键，避免多 bot 共用同一个 session_id 时串状态。"""
-        platform = event.get_platform_name() or ""
+        platform = self._get_platform_id(event)
         self_id = event.get_self_id() or ""
         session_id = event.message_obj.session_id or ""
         group_id = event.get_group_id() or ""
         return f"{platform}:{self_id}:{group_id}:{session_id}"
+
+    def _get_platform_id(self, event: AstrMessageEvent) -> str:
+        """获取平台实例 ID；多适配器同名时不能只使用平台名称。"""
+        get_platform_id = getattr(event, "get_platform_id", None)
+        if callable(get_platform_id):
+            platform_id = get_platform_id()
+            if platform_id:
+                return platform_id
+        return event.get_platform_name() or ""
 
     def _get_msg_key(self, event: AstrMessageEvent, msg_id: str = None) -> str:
         """生成插件内部消息键，避免不同 bot 的 message_id 碰撞。"""
@@ -608,15 +617,21 @@ class DebouncePlugin(Star):
             self.skip_debounce_msg_ids.add(
                 self._get_msg_key(original_event, new_message.message_id)
             )
-            
+
+            platform_id = self._get_platform_id(original_event)
+            self_id = original_event.get_self_id()
+
             # 伪造事件并提交
             await StarTools.create_event(
                 abm=new_message,
-                platform=original_event.get_platform_name(),
+                platform=platform_id,
                 is_wake=True
             )
-            
-            logger.debug(f"[Debounce] 已伪造事件发送: {message_text[:50]}")
+
+            logger.debug(
+                f"[Debounce] 已伪造事件发送: platform={platform_id}, "
+                f"self_id={self_id}, text={message_text[:50]}"
+            )
             
         except Exception as e:
             logger.error(f"[Debounce] 伪造事件失败: {e}")
