@@ -241,9 +241,10 @@ class DebouncePlugin(Star):
         """生成插件内部会话键，避免多 bot 共用同一个 session_id 时串状态。"""
         platform = self._get_platform_id(event)
         self_id = event.get_self_id() or ""
+        sender_id = self._get_sender_id(event)
         session_id = event.message_obj.session_id or ""
         group_id = event.get_group_id() or ""
-        return f"{platform}:{self_id}:{group_id}:{session_id}"
+        return f"{platform}:{self_id}:{group_id}:{sender_id}:{session_id}"
 
     def _get_platform_id(self, event: AstrMessageEvent) -> str:
         """获取平台实例 ID；多适配器同名时不能只使用平台名称。"""
@@ -258,11 +259,102 @@ class DebouncePlugin(Star):
         """生成插件内部消息键，避免不同 bot 的 message_id 碰撞。"""
         return f"{self._get_session_key(event)}:{msg_id or event.message_obj.message_id}"
 
+    def _get_sender_id(self, event: AstrMessageEvent) -> str:
+        """获取发送者 ID；群聊防抖必须隔离不同用户。"""
+        get_sender_id = getattr(event, "get_sender_id", None)
+        if callable(get_sender_id):
+            sender_id = get_sender_id()
+            if sender_id:
+                return str(sender_id)
+        sender = getattr(event.message_obj, "sender", None)
+        sender_id = getattr(sender, "user_id", "")
+        return str(sender_id or "")
+
     def _get_buffer(self, session_id: str) -> MessageBuffer:
         """获取或创建消息缓冲区"""
         if session_id not in self.buffers:
             self.buffers[session_id] = MessageBuffer()
         return self.buffers[session_id]
+
+    def _should_handle_event(self, event: AstrMessageEvent) -> bool:
+        """检查插件开关和使用场景。"""
+        if not self.config.get("enabled", True):
+            return False
+
+        usage_scope = self.config.get("usage_scope", "both")
+        is_private = event.is_private_chat()
+        if usage_scope == "group" and is_private:
+            return False
+        if usage_scope == "private" and not is_private:
+            return False
+        return True
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def on_followup_message(self, event: AstrMessageEvent):
+        """捕获已进入防抖等待的非唤醒后续消息。"""
+        if not self._should_handle_event(event):
+            return
+
+        if self._is_wake_event(event):
+            return
+
+        session_id = self._get_session_key(event)
+        if session_id not in self.waiting_sessions and session_id not in self.pending_llm_sessions:
+            return
+
+        msg_id = self._get_msg_key(event)
+        if msg_id in self.skip_debounce_msg_ids:
+            return
+
+        message_text = event.message_str.strip()
+        if not message_text:
+            return
+
+        if session_id in self.pending_llm_sessions:
+            self.discard_next_response.add(session_id)
+            logger.debug(f"[Debounce] 捕获非唤醒后续消息，标记旧LLM响应丢弃: {session_id}")
+
+        if session_id in self.monitor_tasks:
+            self.monitor_tasks[session_id].cancel()
+            del self.monitor_tasks[session_id]
+
+        buffer = self._get_buffer(session_id)
+        buffer.add(message_text, event)
+        self.waiting_sessions.add(session_id)
+
+        if len(buffer.messages) > 1:
+            if session_id in self.monitor_tasks:
+                self.monitor_tasks[session_id].cancel()
+                del self.monitor_tasks[session_id]
+
+            full_text = buffer.get_full_text()
+            saved_event = buffer.event
+            self.waiting_sessions.discard(session_id)
+            buffer.clear()
+
+            logger.debug(f"[Debounce] 非唤醒后续消息触发合并发送: {session_id}, text={full_text}")
+            await self._send_fake_event(saved_event, full_text)
+            return
+
+        timeout_seconds = self.config.get("timeout_seconds", 30)
+        if timeout_seconds > 0:
+            task = asyncio.create_task(self._monitor_session(session_id, timeout_seconds))
+            self.monitor_tasks[session_id] = task
+
+        logger.debug(
+            f"[Debounce] 已捕获非唤醒后续消息: {session_id}, "
+            f"buffer消息数: {len(buffer.messages)}"
+        )
+
+    def _is_wake_event(self, event: AstrMessageEvent) -> bool:
+        """判断消息是否已经唤醒，避免与 LLM 请求钩子重复处理。"""
+        is_at_or_wake_command = getattr(event, "is_at_or_wake_command", False)
+        if callable(is_at_or_wake_command):
+            is_at_or_wake_command = is_at_or_wake_command()
+        is_wake = getattr(event, "is_wake", False)
+        if callable(is_wake):
+            is_wake = is_wake()
+        return bool(is_at_or_wake_command or is_wake)
     
     @filter.on_waiting_llm_request(priority=100)
     async def on_waiting_llm_request(self, event: AstrMessageEvent):
