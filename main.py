@@ -707,7 +707,7 @@ class DebouncePlugin(Star):
             # 在开头添加合并后的文本
             new_message_components.insert(0, Plain(message_text))
             
-            # 创建新消息对象
+            # 复用最后一条真实消息的 message_id，让 AstrBot 的“引用原文”引用它。
             new_message = await StarTools.create_message(
                 type=str(original_event.message_obj.type.value),
                 self_id=original_event.get_self_id(),
@@ -715,6 +715,8 @@ class DebouncePlugin(Star):
                 sender=original_event.message_obj.sender,
                 message=new_message_components,
                 message_str=message_text,
+                message_id=original_event.message_obj.message_id,
+                raw_message=original_event.message_obj.raw_message,
                 group_id=original_event.get_group_id() or ""
             )
             
@@ -735,7 +737,8 @@ class DebouncePlugin(Star):
 
             logger.debug(
                 f"[Debounce] 已伪造事件发送: platform={platform_id}, "
-                f"self_id={self_id}, text={message_text[:50]}"
+                f"self_id={self_id}, quote_msg_id={new_message.message_id}, "
+                f"text={message_text[:50]}"
             )
             
         except Exception as e:
