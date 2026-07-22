@@ -98,13 +98,13 @@ class DebouncePlugin(Star):
         self.config = config
         logger.debug(f"插件配置: {dict(config)}")
         
-        # 消息缓冲区 {session_id: MessageBuffer}
+        # 消息缓冲区 {scoped_session_id: MessageBuffer}
         self.buffers: Dict[str, MessageBuffer] = {}
         
         # 正在等待中的会话集合（等待更多消息）
         self.waiting_sessions: set = set()
         
-        # 后台监控任务集合 {session_id: Task}
+        # 后台监控任务集合 {scoped_session_id: Task}
         self.monitor_tasks: Dict[str, asyncio.Task] = {}
         
         # 跳过防抖的消息ID集合（伪造的消息）
@@ -116,7 +116,7 @@ class DebouncePlugin(Star):
         # 需要丢弃下一个响应的会话集合（简化：只需要标记，不需要计数）
         self.discard_next_response: set = set()
         
-        # 正在等待session lock的消息ID {session_id: msg_id}
+        # 正在等待session lock的消息ID {scoped_session_id: scoped_msg_id}
         self.waiting_msg_ids: Dict[str, str] = {}
         
         # 应该被取消的消息ID集合（在on_llm_request中直接取消）
@@ -237,6 +237,18 @@ class DebouncePlugin(Star):
             logger.error(traceback.format_exc())
             return False
     
+    def _get_session_key(self, event: AstrMessageEvent) -> str:
+        """生成插件内部会话键，避免多 bot 共用同一个 session_id 时串状态。"""
+        platform = event.get_platform_name() or ""
+        self_id = event.get_self_id() or ""
+        session_id = event.message_obj.session_id or ""
+        group_id = event.get_group_id() or ""
+        return f"{platform}:{self_id}:{group_id}:{session_id}"
+
+    def _get_msg_key(self, event: AstrMessageEvent, msg_id: str = None) -> str:
+        """生成插件内部消息键，避免不同 bot 的 message_id 碰撞。"""
+        return f"{self._get_session_key(event)}:{msg_id or event.message_obj.message_id}"
+
     def _get_buffer(self, session_id: str) -> MessageBuffer:
         """获取或创建消息缓冲区"""
         if session_id not in self.buffers:
@@ -259,8 +271,8 @@ class DebouncePlugin(Star):
         if usage_scope == "private" and not is_private:
             return
         
-        session_id = event.message_obj.session_id
-        msg_id = event.message_obj.message_id
+        session_id = self._get_session_key(event)
+        msg_id = self._get_msg_key(event)
         
         # 跳过伪造消息
         if msg_id in self.skip_debounce_msg_ids:
@@ -308,9 +320,9 @@ class DebouncePlugin(Star):
         if usage_scope == "private" and not is_private:
             return
         
-        session_id = event.message_obj.session_id
+        session_id = self._get_session_key(event)
         message_text = event.message_str.strip()
-        msg_id = event.message_obj.message_id
+        msg_id = self._get_msg_key(event)
         
         # 清除等待记录（当前消息获得了锁）
         if self.waiting_msg_ids.get(session_id) == msg_id:
@@ -466,7 +478,7 @@ class DebouncePlugin(Star):
         if usage_scope == "private" and not is_private:
             return
         
-        session_id = event.message_obj.session_id
+        session_id = self._get_session_key(event)
         
         # 检查是否需要丢弃这个回复
         if session_id in self.discard_next_response:
@@ -593,7 +605,9 @@ class DebouncePlugin(Star):
             )
             
             # 标记这个消息需要跳过防抖
-            self.skip_debounce_msg_ids.add(new_message.message_id)
+            self.skip_debounce_msg_ids.add(
+                self._get_msg_key(original_event, new_message.message_id)
+            )
             
             # 伪造事件并提交
             await StarTools.create_event(
